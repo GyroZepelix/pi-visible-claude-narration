@@ -11,7 +11,6 @@ Repository-local planning and execution artifacts.
 <!-- spec-items:active:start -->
 | Item | Kind | Status | Updated |
 | --- | --- | --- | --- |
-| [Show Claude narration as visible reply text](./active/261027-2019-show-claude-narration-as-visible-reply-text/plan.md) | work-item | planned | 2026-10-27 |
 <!-- spec-items:active:end -->
 
 ## Archive
@@ -19,6 +18,7 @@ Repository-local planning and execution artifacts.
 <!-- spec-items:archive:start -->
 | Item | Kind | Status | Updated |
 | --- | --- | --- | --- |
+| [Show Claude narration as visible reply text](./archive/261027-2019-show-claude-narration-as-visible-reply-text/plan.md) | work-item | completed | 2026-10-27 |
 <!-- spec-items:archive:end -->
 
 ## Templates

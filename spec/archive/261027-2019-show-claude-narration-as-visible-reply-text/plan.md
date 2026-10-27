@@ -111,7 +111,7 @@ Assurance: medium - the extension runs on every Claude response in every session
   - Scope: copy the session containing `4796ddb9` to a temporary directory, open it with `pi --session <copy> -e ./src/index.ts` in a tmux pane, capture with `tmux capture-pane -e -p`, then close the pane. No model request is needed.
   - Acceptance: the narration line starts with the accent `> ` marker and uses the theme `text` color without italic; the preceding reasoning keeps `thinkingText` italic.
   - Verification: inspect captured ANSI codes against `ctx.ui.theme` colors (dark theme: `text` 222;224;225, `thinkingText` 150;160;164).
-- [ ] T09: Publish and install
+- [x] T09: Publish and install
   - Depends on: T06, T07, T08, final review
   - Scope: after explicit approval for each step: initial commit, `git remote add origin git@github.com:GyroZepelix/pi-visible-claude-narration.git`, push, then add `git:git@github.com:GyroZepelix/pi-visible-claude-narration.git` to `~/.pi/agent/settings.json` `packages` and verify pi lists the extension at startup.
   - Acceptance: repository public on GitHub with the committed source; a fresh pi startup lists the extension.
@@ -144,8 +144,8 @@ Assurance: medium - the extension runs on every Claude response in every session
 
 - [x] Planning complete and confirmed.
 - [x] Implementation T01-T08 complete (2026-10-27).
-- [ ] T09 partial: steps 1-2 done by the user (initial commit `0a1e104` "feat: initial commit" with scaffold and plan; `origin` = `git@github.com:GyroZepelix/pi-visible-claude-narration.git`, `origin/master` = `0a1e104`). Steps 3-4 (push, `~/.pi/agent/settings.json` package entry, pi startup listing check) approved and scheduled immediately after the checkpoint commit that contains the implementation.
-- [x] Verification run for T01-T08: see `verification.md`; segment and final contract-quality reviews PASS.
+- [x] T09 complete: steps 1-2 by the user (`0a1e104`, `origin`); checkpoint commit `eb59d16` pushed; `~/.pi/agent/settings.json` package entry added; fresh pi startup lists the extension (see `verification.md`).
+- [x] Verification run for T01-T09: see `verification.md`; segment and final contract-quality reviews PASS.
 
 ## Execution handoff
 
