@@ -1,0 +1,681 @@
+From 50ec66f75d57ad55838a9fe4da5e66f29af4d73c Mon Sep 17 00:00:00 2001
+From: Brit <10531428+H4vC@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 19:34:31 +0200
+Subject: [PATCH] fix(ai): show Anthropic between-tool narration as reply text
+
+Opus 5.5 returns prose written between tool calls as a signed thinking block whose signature header kind is "narration", so mid-task replies folded into the Thought block. Flag those blocks (ThinkingContent.narration, read from the signature header like Claude Code does, no length cap) and present them as answer text in the TUI, streaming reveal, print mode, ACP, and HTML export; replay keeps them as signed thinking.
+---
+ packages/ai/CHANGELOG.md                      |  1 +
+ packages/ai/src/index.ts                      |  1 +
+ packages/ai/src/providers/amazon-bedrock.ts   |  3 +
+ .../ai/src/providers/anthropic-signature.ts   | 43 +++++++--
+ packages/ai/src/providers/anthropic.ts        |  9 +-
+ packages/ai/src/types.ts                      |  7 ++
+ packages/ai/src/utils/narration.ts            | 18 ++++
+ packages/ai/test/anthropic-signature.test.ts  | 90 +++++++++++++++++++
+ packages/coding-agent/CHANGELOG.md            |  1 +
+ .../coding-agent/src/export/html/template.js  |  8 +-
+ .../coding-agent/src/modes/acp/acp-agent.ts   |  2 +-
+ .../src/modes/acp/acp-event-mapper.ts         | 12 +++
+ .../src/modes/controllers/btw-controller.ts   |  1 +
+ .../src/modes/controllers/streaming-reveal.ts |  4 +
+ packages/coding-agent/src/modes/print-mode.ts |  5 +-
+ .../src/modes/rpc/wire/content.ts             |  4 +
+ .../src/modes/rpc/wire/rpc-wire.generated.ts  |  2 +
+ .../src/modes/rpc/wire/rpc-wire.schema.json   |  4 +
+ packages/coding-agent/src/session/messages.ts |  3 +-
+ packages/tui/src/chat/assistant-message.ts    |  4 +-
+ .../test/assistant-message-narration.test.ts  | 54 +++++++++++
+ sdk/go/omp-rpc/wire.go                        |  3 +
+ sdk/python/omp-rpc/src/omp_rpc/_wire.py       |  2 +
+ sdk/rust/omp-rpc/src/wire.rs                  |  7 ++
+ 24 files changed, 269 insertions(+), 19 deletions(-)
+ create mode 100644 packages/ai/src/utils/narration.ts
+ create mode 100644 packages/tui/test/assistant-message-narration.test.ts
+
+diff --git a/packages/ai/CHANGELOG.md b/packages/ai/CHANGELOG.md
+index 2d6785baf8af..d27008a42d0e 100644
+--- a/packages/ai/CHANGELOG.md
++++ b/packages/ai/CHANGELOG.md
+@@ -8,6 +8,7 @@
+ 
+ ### Added
+ 
++- Added `ThinkingContent.narration`, set on Anthropic and Bedrock thinking blocks whose signature marks them as between-tool narration, and `presentNarrationAsAnswer(message)` to show those blocks as reply text while replay keeps them as signed thinking
+ - Added `keys.peek(provider, { includeExpired: true })` to name the stored account behind an expired OAuth token for reads that never send it, such as keying an offline model-cache lookup ([#16061](https://github.com/can1357/oh-my-pi/pull/16061) by [@gchai](https://github.com/gchai))
+ - Added `prewarmModelConnection(model)` (`providers/connection-prewarm`), which opens the model's API connection ahead of a request using the same transport and TLS settings so the request reuses it instead of paying the connection handshake ([#16086](https://github.com/can1357/oh-my-pi/pull/16086) by [@H4vC](https://github.com/H4vC))
+ 
+diff --git a/packages/ai/src/index.ts b/packages/ai/src/index.ts
+index 5ab3d4c4deb7..16472fbbbebb 100644
+--- a/packages/ai/src/index.ts
++++ b/packages/ai/src/index.ts
+@@ -65,6 +65,7 @@ export * from "./utils/anthropic-auth";
+ export * from "./utils/event-stream";
+ export * from "./utils/glyph-codec";
+ export * from "./utils/openrouter-headers";
++export * from "./utils/narration";
+ export * from "./utils/schema";
+ export * from "./utils/thinking-loop";
+ export * from "./utils/tool-call-loop-guard";
+diff --git a/packages/ai/src/providers/amazon-bedrock.ts b/packages/ai/src/providers/amazon-bedrock.ts
+index 80ef9eb01318..644815b61ba3 100644
+--- a/packages/ai/src/providers/amazon-bedrock.ts
++++ b/packages/ai/src/providers/amazon-bedrock.ts
+@@ -50,6 +50,7 @@ import { invalidateAwsCredentialCache, resolveAwsCredentials } from "./aws-crede
+ import { decodeEventStream } from "./aws-eventstream";
+ import { signRequest } from "./aws-sigv4";
+ import { isThinkingPrefixBindingError } from "./anthropic";
++import { isAnthropicNarrationSignature } from "./anthropic-signature";
+ import { parseAnthropicInputTransformations, THINKING_BINDING_CONTROLS_BETA } from "./anthropic-wire";
+ import { isBedrockRequestMetadataValue } from "./bedrock-request-metadata";
+ import { transformMessages } from "./transform-messages";
+@@ -977,6 +978,8 @@ function handleContentBlockStop(
+ 			stream.push({ type: "text_end", contentIndex: index, content: block.text, partial: output });
+ 			break;
+ 		case "thinking":
++			// Claude on Bedrock carries Anthropic's signature format, narration kind included.
++			if (block.thinkingSignature && isAnthropicNarrationSignature(block.thinkingSignature)) block.narration = true;
+ 			stream.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: output });
+ 			break;
+ 		case "toolCall":
+diff --git a/packages/ai/src/providers/anthropic-signature.ts b/packages/ai/src/providers/anthropic-signature.ts
+index be6c99899dbf..a04a6a6152d1 100644
+--- a/packages/ai/src/providers/anthropic-signature.ts
++++ b/packages/ai/src/providers/anthropic-signature.ts
+@@ -1,21 +1,26 @@
+ /**
+- * Recovers the serving model id Anthropic embeds in thinking-block signatures.
++ * Reads the cleartext header Anthropic embeds in thinking-block signatures.
+  *
+  * A signature is a base64 protobuf: outer `{1: version, 2: envelope}`, envelope
+  * `{1: header, 2..5: nonce/ciphertext/tag}`, header
+- * `{1: schema, 5: hash, 6: model, 8: "thinking", 11: org uuid, 15: profile, 21: unix ts}`.
++ * `{1: schema, 5: hash, 6: model, 8: kind, 11: org uuid, 15: profile, 21: unix ts}`.
+  * Field 6 names the model that actually produced the block — a concrete
+  * snapshot (`claude-haiku-4-5-20251001`) or an internal codename
+  * (`numbat-v6-…`) — which lets a caller notice a gateway serving something other
+  * than the requested model. The v4 outer format (`CAQS…`) ships a header
+  * without field 6; the decoder then yields nothing.
++ * Field 8 names the block kind: `thinking` for reasoning, `narration` for the
++ * user-facing prose the API converts into a thinking block when the model
++ * writes it between tool calls (connector-text summarization).
+  */
+ 
+ const OUTER_ENVELOPE_FIELD = 2;
+ const ENVELOPE_HEADER_FIELD = 1;
+ const HEADER_MODEL_FIELD = 6;
++const HEADER_KIND_FIELD = 8;
+ const MAX_MODEL_ID_LENGTH = 128;
+ const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/;
++const NARRATION_KIND = Buffer.from("narration");
+ 
+ /** Finds a length-delimited field, rejecting tags and lengths that exceed uint32. */
+ function lengthDelimitedField(message: Uint8Array, field: number): Uint8Array | undefined {
+@@ -71,12 +76,12 @@ function lengthDelimitedField(message: Uint8Array, field: number): Uint8Array |
+ }
+ 
+ /**
+- * Model id embedded in an Anthropic thinking signature, or undefined when the
+- * signature is malformed, uses a format without a cleartext header, or names
+- * nothing resembling a model id.
++ * Cleartext header of an Anthropic thinking signature, or undefined when malformed or absent.
++ * No upper length bound: the signature grows with its block, and a long reply's
++ * narration signature runs past 13k characters.
+  */
+-export function servedModelFromAnthropicSignature(signature: string): string | undefined {
+-	if (signature.length < 8 || signature.length > 8192) return undefined;
++function anthropicSignatureHeader(signature: string): Uint8Array | undefined {
++	if (signature.length < 8) return undefined;
+ 	let raw: Uint8Array;
+ 	try {
+ 		raw = Buffer.from(signature, "base64");
+@@ -85,7 +90,16 @@ export function servedModelFromAnthropicSignature(signature: string): string | u
+ 	}
+ 	const envelope = lengthDelimitedField(raw, OUTER_ENVELOPE_FIELD);
+ 	if (!envelope) return undefined;
+-	const header = lengthDelimitedField(envelope, ENVELOPE_HEADER_FIELD);
++	return lengthDelimitedField(envelope, ENVELOPE_HEADER_FIELD);
++}
++
++/**
++ * Model id embedded in an Anthropic thinking signature, or undefined when the
++ * signature is malformed, uses a format without a cleartext header, or names
++ * nothing resembling a model id.
++ */
++export function servedModelFromAnthropicSignature(signature: string): string | undefined {
++	const header = anthropicSignatureHeader(signature);
+ 	if (!header) return undefined;
+ 	const modelBytes = lengthDelimitedField(header, HEADER_MODEL_FIELD);
+ 	if (!modelBytes || modelBytes.length === 0 || modelBytes.length > MAX_MODEL_ID_LENGTH) return undefined;
+@@ -93,6 +107,19 @@ export function servedModelFromAnthropicSignature(signature: string): string | u
+ 	return MODEL_ID_PATTERN.test(model) ? model : undefined;
+ }
+ 
++/**
++ * Whether an Anthropic thinking signature marks its block as narration: prose
++ * the model addressed to the user between tool calls, which the API returns as
++ * a thinking block. Only an exact `narration` kind matches; any other or
++ * unreadable header stays reasoning.
++ */
++export function isAnthropicNarrationSignature(signature: string): boolean {
++	const header = anthropicSignatureHeader(signature);
++	if (!header) return false;
++	const kind = lengthDelimitedField(header, HEADER_KIND_FIELD);
++	return kind !== undefined && Buffer.from(kind).equals(NARRATION_KIND);
++}
++
+ /**
+  * Model id from an OpenRouter reasoning item — a `reasoning_details` entry on
+  * chat completions or a Responses `reasoning` output item — which forwards the
+diff --git a/packages/ai/src/providers/anthropic.ts b/packages/ai/src/providers/anthropic.ts
+index 7de8fa060620..cdd119597a61 100644
+--- a/packages/ai/src/providers/anthropic.ts
++++ b/packages/ai/src/providers/anthropic.ts
+@@ -144,7 +144,7 @@ import {
+ 	wrapFetchForCopilotFallback,
+ } from "./github-copilot-headers";
+ import { prepareAnthropicImageContext } from "./anthropic-images";
+-import { servedModelFromAnthropicSignature } from "./anthropic-signature";
++import { isAnthropicNarrationSignature, servedModelFromAnthropicSignature } from "./anthropic-signature";
+ import { getOpenAIPromptCacheKey } from "./openai-shared";
+ import { applyInferenceHeaders } from "./inference-headers";
+ import { isAnthropicMessagesModel, redactSensitiveCredentials, transformMessages } from "./transform-messages";
+@@ -2611,11 +2611,14 @@ const streamAnthropicOnce = (
+ 					if (unwrappedThinking !== undefined) {
+ 						block.thinking = unwrappedThinking;
+ 						block.thinkingSignature = undefined;
+-					} else if (!output.upstreamModel && block.thinkingSignature) {
++					} else if (block.thinkingSignature) {
+ 						// The signature names the model that actually produced the
+ 						// block; a gateway serving a different model than requested
+ 						// cannot mint one that says otherwise.
+-						output.upstreamModel = servedModelFromAnthropicSignature(block.thinkingSignature);
++						if (!output.upstreamModel) {
++							output.upstreamModel = servedModelFromAnthropicSignature(block.thinkingSignature);
++						}
++						if (isAnthropicNarrationSignature(block.thinkingSignature)) block.narration = true;
+ 					}
+ 					stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
+ 				} else if (block.type === "anthropicServerTool" && block.block.type === "server_tool_use") {
+diff --git a/packages/ai/src/types.ts b/packages/ai/src/types.ts
+index 801fd517a244..ec7bdffcd846 100644
+--- a/packages/ai/src/types.ts
++++ b/packages/ai/src/types.ts
+@@ -896,6 +896,13 @@ export interface ThinkingContent {
+ 	 * replay natively on another host.
+ 	 */
+ 	summary?: boolean;
++	/**
++	 * `true`: the block is narration — prose the model addressed to the user
++	 * between tool calls, which the provider returned as a signed thinking block
++	 * (Anthropic connector-text summarization). It stays a thinking block for
++	 * replay; user-facing surfaces present it as answer text.
++	 */
++	narration?: boolean;
+ }
+ 
+ export interface RedactedThinkingContent {
+diff --git a/packages/ai/src/utils/narration.ts b/packages/ai/src/utils/narration.ts
+new file mode 100644
+index 000000000000..f20a2988b014
+--- /dev/null
++++ b/packages/ai/src/utils/narration.ts
+@@ -0,0 +1,18 @@
++import type { AssistantMessage } from "../types";
++
++/**
++ * The message as a user-facing surface should present it: every narration
++ * thinking block (see `ThinkingContent.narration`) becomes a text block, so it
++ * renders as part of the answer instead of folding into reasoning. Returns the
++ * input unchanged when it holds no narration. Display-only: replay must keep
++ * the original thinking blocks and their signatures.
++ */
++export function presentNarrationAsAnswer(message: AssistantMessage): AssistantMessage {
++	if (!message.content.some(block => block.type === "thinking" && block.narration)) return message;
++	return {
++		...message,
++		content: message.content.map(block =>
++			block.type === "thinking" && block.narration ? { type: "text", text: block.thinking } : block,
++		),
++	};
++}
+diff --git a/packages/ai/test/anthropic-signature.test.ts b/packages/ai/test/anthropic-signature.test.ts
+index 0fd30d3b7dc4..fb59e1cc57c3 100644
+--- a/packages/ai/test/anthropic-signature.test.ts
++++ b/packages/ai/test/anthropic-signature.test.ts
+@@ -164,3 +164,93 @@ describe("anthropic stream served-model recovery", () => {
+ 		expect(message.upstreamModel).toBe("claude-opus-5");
+ 	});
+ });
++
++function varint(value: number): number[] {
++	const bytes: number[] = [];
++	while (value > 0x7f) {
++		bytes.push((value & 0x7f) | 0x80);
++		value >>>= 7;
++	}
++	bytes.push(value);
++	return bytes;
++}
++
++/**
++ * A v4 signature (`CAQS…`) with header kind `kind`, shaped like the ones
++ * api.anthropic.com returned for claude-opus-5-5: `{1: 18, 3: 2, 7: 1, 8: kind}`,
++ * followed by `ciphertextBytes` of opaque payload.
++ */
++function v4Signature(kind: string, ciphertextBytes = 4): string {
++	const kindBytes = Buffer.from(kind);
++	const header = [0x08, 0x12, 0x18, 0x02, 0x38, 0x01, 0x42, kindBytes.length, ...kindBytes];
++	const envelope = [
++		0x0a,
++		header.length,
++		...header,
++		0x12,
++		...varint(ciphertextBytes),
++		...new Array<number>(ciphertextBytes).fill(0xab),
++	];
++	return Buffer.from([0x08, 0x04, 0x12, ...varint(envelope.length), ...envelope]).toString("base64");
++}
++
++describe("anthropic stream narration", () => {
++	it("marks only the thinking block whose signature names it narration", async () => {
++		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
++			() =>
++				createMockRequest([
++					{
++						type: "message_start",
++						message: { id: "msg_x", model: "claude-sonnet-5", usage: { input_tokens: 10, output_tokens: 0 } },
++					},
++					{ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
++					{ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Check the log." } },
++					{
++						type: "content_block_delta",
++						index: 0,
++						delta: { type: "signature_delta", signature: v4Signature("thinking") },
++					},
++					{ type: "content_block_stop", index: 0 },
++					{ type: "content_block_start", index: 1, content_block: { type: "thinking", thinking: "" } },
++					{
++						type: "content_block_delta",
++						index: 1,
++						delta: { type: "thinking_delta", thinking: "The build is running." },
++					},
++					{
++						// A long reply's signature: past 13k characters on the wire.
++						type: "content_block_delta",
++						index: 1,
++						delta: { type: "signature_delta", signature: v4Signature("narration", 10_000) },
++					},
++					{ type: "content_block_stop", index: 1 },
++					{
++						type: "content_block_start",
++						index: 2,
++						content_block: { type: "tool_use", id: "toolu_1", name: "wait", input: {} },
++					},
++					{ type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: "{}" } },
++					{ type: "content_block_stop", index: 2 },
++					{ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 4 } },
++					{ type: "message_stop" },
++				]) as never,
++		);
++
++		const s = streamAnthropic(sonnetModel, context, { apiKey: "sk-ant-test" });
++		for await (const _ of s) {
++			// drain
++		}
++		const message = await s.result();
++
++		const [reasoning, narration] = message.content;
++		expect(reasoning).toMatchObject({ type: "thinking", thinking: "Check the log." });
++		expect(reasoning).not.toHaveProperty("narration");
++		// Stays a signed thinking block so replay sends it back unchanged.
++		expect(narration).toMatchObject({
++			type: "thinking",
++			thinking: "The build is running.",
++			thinkingSignature: v4Signature("narration", 10_000),
++			narration: true,
++		});
++	});
++});
+diff --git a/packages/coding-agent/CHANGELOG.md b/packages/coding-agent/CHANGELOG.md
+index 377f5b4318eb..e9b1e2b49e56 100644
+--- a/packages/coding-agent/CHANGELOG.md
++++ b/packages/coding-agent/CHANGELOG.md
+@@ -16,6 +16,7 @@
+ 
+ ### Fixed
+ 
++- Fixed Claude Opus 5.5 replies sent between tool calls (for example an answer to a question asked mid-task) being folded into the "Thought" block; they now show as normal reply text in the transcript, print mode, ACP clients, and HTML exports
+ - Fixed the startup connection warm-up silently doing nothing on Windows, where Bun's `fetch.preconnect` throws ([#16086](https://github.com/can1357/oh-my-pi/pull/16086) by [@H4vC](https://github.com/H4vC))
+ - Fixed the RPC frame codec (`modes/rpc/rpc-frame`) failing to bundle for Node because it pulled in Bun-only modules and the native addon ([#16072](https://github.com/can1357/oh-my-pi/pull/16072) by [@oyty](https://github.com/oyty))
+ - Fixed `auth-gateway` strict probes sending a raw token instead of the structured credential blob for Alibaba Coding Plan and Snowflake logins ([#16092](https://github.com/can1357/oh-my-pi/pull/16092) by [@H4vC](https://github.com/H4vC))
+diff --git a/packages/coding-agent/src/export/html/template.js b/packages/coding-agent/src/export/html/template.js
+index baada9920ab9..3634eeb3e408 100644
+--- a/packages/coding-agent/src/export/html/template.js
++++ b/packages/coding-agent/src/export/html/template.js
+@@ -1268,10 +1268,12 @@
+             for (let blockIndex = 0; blockIndex < msg.content.length; blockIndex++) {
+               const block = msg.content[blockIndex];
+               const blockId = assistantBlockDomId(entry.id, blockIndex, sctx);
+-              if (block.type === 'text') {
+-                const canon = canonicalizeMessage(block.text);
++              // Narration is prose for the user that the provider returned as thinking.
++              const answerText = block.type === 'text' ? block.text : block.type === 'thinking' && block.narration ? block.thinking : undefined;
++              if (answerText !== undefined) {
++                const canon = canonicalizeMessage(answerText);
+                 if (canon) {
+-                  html += `<div class="assistant-text markdown-content" id="${blockId}">${safeMarkedParse(block.text)}</div>`;
++                  html += `<div class="assistant-text markdown-content" id="${blockId}">${safeMarkedParse(answerText)}</div>`;
+                 }
+               } else if (block.type === 'thinking') {
+                 const thinking = canonicalizeMessage(block.thinking);
+diff --git a/packages/coding-agent/src/modes/acp/acp-agent.ts b/packages/coding-agent/src/modes/acp/acp-agent.ts
+index cbd5fd5aa3b0..cfdd73a8bd1a 100644
+--- a/packages/coding-agent/src/modes/acp/acp-agent.ts
++++ b/packages/coding-agent/src/modes/acp/acp-agent.ts
+@@ -2409,7 +2409,7 @@ export class AcpAgent implements Agent {
+ 					notifications.push({
+ 						sessionId,
+ 						update: {
+-							sessionUpdate: "agent_thought_chunk",
++							sessionUpdate: item.narration ? "agent_message_chunk" : "agent_thought_chunk",
+ 							content: { type: "text", text: thinking },
+ 							messageId,
+ 						},
+diff --git a/packages/coding-agent/src/modes/acp/acp-event-mapper.ts b/packages/coding-agent/src/modes/acp/acp-event-mapper.ts
+index 12a9be285dee..48827cc60af8 100644
+--- a/packages/coding-agent/src/modes/acp/acp-event-mapper.ts
++++ b/packages/coding-agent/src/modes/acp/acp-event-mapper.ts
+@@ -308,6 +308,18 @@ function mapAssistantMessageUpdate(
+ 			}
+ 			break;
+ 		}
++		case "thinking_end": {
++			// Narration streams as thinking; once its block closes as narration,
++			// surface it as the reply it is.
++			const block = event.assistantMessageEvent.partial?.content?.[event.assistantMessageEvent.contentIndex];
++			if (block?.type !== "thinking" || !block.narration) return [];
++			sessionUpdate = "agent_message_chunk";
++			text = canonicalizeMessage(event.assistantMessageEvent.content);
++			if (text.length > 0 && progress) {
++				progress.textEmitted = true;
++			}
++			break;
++		}
+ 		case "done":
+ 			if (progress?.textEmitted) {
+ 				return [];
+diff --git a/packages/coding-agent/src/modes/controllers/btw-controller.ts b/packages/coding-agent/src/modes/controllers/btw-controller.ts
+index 71916727be5d..7686e5110295 100644
+--- a/packages/coding-agent/src/modes/controllers/btw-controller.ts
++++ b/packages/coding-agent/src/modes/controllers/btw-controller.ts
+@@ -42,6 +42,7 @@ function assistantMessageWithReplyText(assistantMessage: AssistantMessage, reply
+ 				type: "thinking",
+ 				thinking: part.thinking,
+ 				...(part.summary !== undefined && { summary: part.summary }),
++				...(part.narration && { narration: true }),
+ 			});
+ 			continue;
+ 		}
+diff --git a/packages/coding-agent/src/modes/controllers/streaming-reveal.ts b/packages/coding-agent/src/modes/controllers/streaming-reveal.ts
+index bd5d7713fdad..ac55ccf0d0ab 100644
+--- a/packages/coding-agent/src/modes/controllers/streaming-reveal.ts
++++ b/packages/coding-agent/src/modes/controllers/streaming-reveal.ts
+@@ -1,4 +1,5 @@
+ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
++import { presentNarrationAsAnswer } from "@oh-my-pi/pi-ai/utils/narration";
+ import { type Component, getSegmenter } from "@oh-my-pi/pi-tui";
+ import { LRUCache } from "@oh-my-pi/pi-utils/lru";
+ import { formatThinkingForDisplay, hasDisplayableThinking } from "@oh-my-pi/pi-tui/chat/thinking-display";
+@@ -297,6 +298,8 @@ export class StreamingRevealController {
+ 	begin(component: StreamingRevealComponent, message: AssistantMessage, hasToolCalls: boolean): void {
+ 		this.stop();
+ 		this.#component = component;
++		// Reveal counts narration as answer text, matching how the component renders it.
++		message = presentNarrationAsAnswer(message);
+ 		this.#target = message;
+ 		this.#revealed = 0;
+ 		this.#hideThinkingBlock = this.#getHideThinkingBlock();
+@@ -323,6 +326,7 @@ export class StreamingRevealController {
+ 	}
+ 
+ 	setTarget(message: AssistantMessage, hasToolCalls: boolean): void {
++		message = presentNarrationAsAnswer(message);
+ 		this.#target = message;
+ 		this.#hideThinkingBlock = this.#getHideThinkingBlock();
+ 		this.#proseOnlyThinking = this.#getProseOnlyThinking();
+diff --git a/packages/coding-agent/src/modes/print-mode.ts b/packages/coding-agent/src/modes/print-mode.ts
+index 5a8ff497d140..c8bca1ba1cd7 100644
+--- a/packages/coding-agent/src/modes/print-mode.ts
++++ b/packages/coding-agent/src/modes/print-mode.ts
+@@ -7,6 +7,7 @@
+  */
+ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+ import type { ImageContent } from "@oh-my-pi/pi-ai";
++import { presentNarrationAsAnswer } from "@oh-my-pi/pi-ai/utils/narration";
+ import { $flag, logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
+ import type { MCPManager } from "../mcp/manager";
+ import { resolveMCPTimeoutMs } from "../mcp/timeout";
+@@ -327,8 +328,8 @@ async function runPrintModeCore(
+ 				process.stderr.write(`${sanitizeText(assistantMsg.errorMessage)}\n`);
+ 			}
+ 
+-			// Output text content
+-			for (const content of assistantMsg.content) {
++			// Output text content; narration the provider returned as thinking is part of the reply.
++			for (const content of presentNarrationAsAnswer(assistantMsg).content) {
+ 				if (content.type === "text") {
+ 					writeStdoutLine(`${sanitizeText(content.text)}\n`);
+ 				} else if (printThoughts && content.type === "thinking" && content.thinking.trim().length > 0) {
+diff --git a/packages/coding-agent/src/modes/rpc/wire/content.ts b/packages/coding-agent/src/modes/rpc/wire/content.ts
+index 2f5f4af205df..626e053edf84 100644
+--- a/packages/coding-agent/src/modes/rpc/wire/content.ts
++++ b/packages/coding-agent/src/modes/rpc/wire/content.ts
+@@ -23,6 +23,10 @@ export const messageDefs = {
+ 		thinking: "string",
+ 		"thinkingSignature?": "string",
+ 		"itemId?": "string",
++		"narration?": doc(
++			"boolean",
++			"Prose the model addressed to the user, returned by the provider as thinking; present it as answer text.",
++		),
+ 	},
+ 	RedactedThinkingContent: { type: "'redactedThinking'", data: "string" },
+ 	ImageContent: doc(
+diff --git a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
+index 47a7737f8d01..067aaa4f4796 100644
+--- a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
++++ b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
+@@ -16,6 +16,8 @@ export interface ThinkingContent {
+ 	thinking: string;
+ 	thinkingSignature?: string;
+ 	itemId?: string;
++	/** Prose the model addressed to the user, returned by the provider as thinking; present it as answer text. */
++	narration?: boolean;
+ }
+ 
+ export interface RedactedThinkingContent {
+diff --git a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
+index 0ec35a33dc5b..c39e07b7da52 100644
+--- a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
++++ b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
+@@ -802,6 +802,10 @@
+ 				},
+ 				"itemId": {
+ 					"type": "string"
++				},
++				"narration": {
++					"type": "boolean",
++					"description": "Prose the model addressed to the user, returned by the provider as thinking; present it as answer text."
+ 				}
+ 			},
+ 			"required": [
+diff --git a/packages/coding-agent/src/session/messages.ts b/packages/coding-agent/src/session/messages.ts
+index 6d7162301538..1bbed1ecd16a 100644
+--- a/packages/coding-agent/src/session/messages.ts
++++ b/packages/coding-agent/src/session/messages.ts
+@@ -99,11 +99,12 @@ export function sanitizeAssistantForReparentedHistory(message: AssistantMessage)
+ 	for (const block of message.content) {
+ 		if (block.type === "redactedThinking" || block.type === "anthropicServerTool") continue;
+ 		if (block.type === "thinking") {
+-			// Signatures are replay-bound and go; the summary state is provenance and stays.
++			// Signatures are replay-bound and go; summary and narration state are provenance and stay.
+ 			content.push({
+ 				type: "thinking",
+ 				thinking: block.thinking,
+ 				...(block.summary !== undefined && { summary: block.summary }),
++				...(block.narration && { narration: true }),
+ 			});
+ 			continue;
+ 		}
+diff --git a/packages/tui/src/chat/assistant-message.ts b/packages/tui/src/chat/assistant-message.ts
+index 2a86f394d0a5..d2a9a9a6f14e 100644
+--- a/packages/tui/src/chat/assistant-message.ts
++++ b/packages/tui/src/chat/assistant-message.ts
+@@ -1,4 +1,5 @@
+ import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
++import { presentNarrationAsAnswer } from "@oh-my-pi/pi-ai/utils/narration";
+ import { type Component, Container } from "../tui";
+ import { Image, type ImageBudget } from "../components/image";
+ import { ImageProtocol, TERMINAL } from "../terminal-capabilities";
+@@ -1803,7 +1804,8 @@ export class AssistantMessageComponent extends Container {
+ 		this.#lastUpdateTransient = opts?.transient === true;
+ 		// Everything below renders the display form; #lastMessage keeps the
+ 		// verbatim message so re-renders re-derive the reaction deterministically.
+-		message = this.#displayMessage(message, this.#lastUpdateTransient);
++		// Narration the provider returned as thinking renders as answer text.
++		message = this.#displayMessage(presentNarrationAsAnswer(message), this.#lastUpdateTransient);
+ 		this.#displayedMessage = message;
+ 
+ 		// Streaming-speed gauge: only a live, in-flight render of the single
+diff --git a/packages/tui/test/assistant-message-narration.test.ts b/packages/tui/test/assistant-message-narration.test.ts
+new file mode 100644
+index 000000000000..568bf6d268a1
+--- /dev/null
++++ b/packages/tui/test/assistant-message-narration.test.ts
+@@ -0,0 +1,54 @@
++import { beforeAll, describe, expect, it } from "bun:test";
++import type { AssistantMessage } from "@oh-my-pi/pi-ai";
++import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
++import { initTheme } from "@oh-my-pi/pi-tui/theme";
++
++const REASONING = "Weighing whether the gradle run already finished.";
++const NARRATION = "The build is running; it should finish in about fifteen minutes.";
++
++function turn(narration: boolean): AssistantMessage {
++	return {
++		role: "assistant",
++		content: [
++			{ type: "thinking", thinking: REASONING, thinkingSignature: "sig-reasoning" },
++			{ type: "thinking", thinking: NARRATION, thinkingSignature: "sig-narration", ...(narration && { narration }) },
++			{ type: "toolCall", id: "toolu_1", name: "wait", arguments: {} },
++		],
++		api: "anthropic-messages",
++		provider: "anthropic",
++		model: "claude-opus-5-5",
++		usage: {
++			input: 0,
++			output: 0,
++			cacheRead: 0,
++			cacheWrite: 0,
++			totalTokens: 0,
++			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
++		},
++		stopReason: "toolUse",
++		timestamp: Date.now(),
++	};
++}
++
++function rendered(message: AssistantMessage): string {
++	// Thinking hidden: only answer text may reach the transcript.
++	return Bun.stripANSI(new AssistantMessageComponent(message, true).render(100).join("\n"));
++}
++
++beforeAll(async () => {
++	await initTheme(false);
++});
++
++describe("narration returned as thinking", () => {
++	// Regression: Opus 5.5 returns between-tool replies as thinking blocks, so a
++	// reply to a mid-task question vanished into the folded reasoning.
++	it("renders narration as answer text while reasoning stays hidden", () => {
++		const output = rendered(turn(true));
++		expect(output).toContain(NARRATION);
++		expect(output).not.toContain(REASONING);
++	});
++
++	it("keeps unmarked thinking hidden", () => {
++		expect(rendered(turn(false))).not.toContain(NARRATION);
++	});
++});
+diff --git a/sdk/go/omp-rpc/wire.go b/sdk/go/omp-rpc/wire.go
+index eea8166308b3..cb4200690426 100644
+--- a/sdk/go/omp-rpc/wire.go
++++ b/sdk/go/omp-rpc/wire.go
+@@ -87,6 +87,8 @@ type ThinkingContent struct {
+ 	Thinking          string  `json:"thinking"`
+ 	ThinkingSignature *string `json:"thinkingSignature,omitempty"`
+ 	ItemID            *string `json:"itemId,omitempty"`
++	// Prose the model addressed to the user, returned by the provider as thinking; present it as answer text.
++	Narration *bool `json:"narration,omitempty"`
+ 	// Extra holds undeclared keys and declared keys whose value did not decode (that field stays zero).
+ 	// Encoding writes them back, over a declared field with the same key.
+ 	Extra map[string]json.RawMessage `json:"-"`
+@@ -103,6 +105,7 @@ func (v *ThinkingContent) decodeFrom(raw map[string]json.RawMessage) error {
+ 	d.required("thinking", &out.Thinking)
+ 	d.optional("thinkingSignature", &out.ThinkingSignature)
+ 	d.optional("itemId", &out.ItemID)
++	d.optional("narration", &out.Narration)
+ 	out.Extra = d.rest()
+ 	if d.err != nil {
+ 		return d.err
+diff --git a/sdk/python/omp-rpc/src/omp_rpc/_wire.py b/sdk/python/omp-rpc/src/omp_rpc/_wire.py
+index 128845b74431..57cb2b1cd1f3 100644
+--- a/sdk/python/omp-rpc/src/omp_rpc/_wire.py
++++ b/sdk/python/omp-rpc/src/omp_rpc/_wire.py
+@@ -212,6 +212,8 @@ class ThinkingContent(TypedDict):
+     thinking: str
+     thinkingSignature: NotRequired[str]
+     itemId: NotRequired[str]
++    narration: NotRequired[bool]
++    """Prose the model addressed to the user, returned by the provider as thinking; present it as answer text."""
+ 
+ 
+ class RedactedThinkingContent(TypedDict):
+diff --git a/sdk/rust/omp-rpc/src/wire.rs b/sdk/rust/omp-rpc/src/wire.rs
+index 7d3cc3728362..a27e29de7010 100644
+--- a/sdk/rust/omp-rpc/src/wire.rs
++++ b/sdk/rust/omp-rpc/src/wire.rs
+@@ -185,6 +185,8 @@ pub struct ThinkingContent {
+ 	pub thinking: Option<String>,
+ 	pub thinking_signature: Option<String>,
+ 	pub item_id: Option<String>,
++	/// Prose the model addressed to the user, returned by the provider as thinking; present it as answer text.
++	pub narration: Option<bool>,
+ 	/// Every key not decoded into a declared field.
+ 	pub extra: Map<String, Value>,
+ }
+@@ -201,11 +203,15 @@ impl Serialize for ThinkingContent {
+ 		if let Some(value) = &self.item_id {
+ 			map.serialize_entry("itemId", value)?;
+ 		}
++		if let Some(value) = &self.narration {
++			map.serialize_entry("narration", value)?;
++		}
+ 		for (key, value) in &self.extra {
+ 			match key.as_str() {
+ 				"thinking" if self.thinking.is_some() => continue,
+ 				"thinkingSignature" if self.thinking_signature.is_some() => continue,
+ 				"itemId" if self.item_id.is_some() => continue,
++				"narration" if self.narration.is_some() => continue,
+ 				_ => {}
+ 			}
+ 			map.serialize_entry(key, value)?;
+@@ -221,6 +227,7 @@ impl<'de> Deserialize<'de> for ThinkingContent {
+ 			thinking: take(&mut extra, "thinking"),
+ 			thinking_signature: take(&mut extra, "thinkingSignature"),
+ 			item_id: take(&mut extra, "itemId"),
++			narration: take(&mut extra, "narration"),
+ 			extra,
+ 		})
+ 	}
