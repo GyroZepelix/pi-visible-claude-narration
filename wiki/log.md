@@ -26,3 +26,11 @@ Use this shape for new entries:
 - Wiki pages changed: `wiki/research/opus-narration-hidden-as-thinking.md`, `wiki/index.md`.
 - Verification: failures reproduced by replaying real sessions with the pi SDK; narration kind confirmed by decoding thinking signatures.
 - Notes: extension not built yet; integration point in pi 1.4.0 still to be verified.
+
+## [2026-10-27] dream | Gamemaster checkpoint for narration extension T01-T08
+
+- Trigger: `/dream` run after `Gamemaster checkpoint: 261027-2019-show-claude-narration-as-visible-reply-text/direct`.
+- Inputs: current implementation session, `src/`, `tests/`, the item's `plan.md` (D15, D16) and `verification.md`, `node_modules/@earendil-works/pi-tui/dist/components/markdown.js`, `node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/interactive-mode.js`, T08 tmux captures.
+- Wiki pages changed: `wiki/architecture/narration-extension.md` (new), `wiki/workflows/live-tui-check.md` (new), `wiki/research/opus-narration-hidden-as-thinking.md` (status line), `wiki/dreams/MEMORY.md` (new), `wiki/index.md`, plus the Dream episode, `wiki/dreams/episodes.jsonl`, and the per-spec ledger.
+- Verification: re-read changed files, checked relative links, ran the memory safety scan and the MEMORY.md token budget, `git diff --check`.
+- Notes: implementation not yet committed or published (T09 pending); ANSI passthrough verified on pi 1.4.0 only.

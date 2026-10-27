@@ -63,48 +63,50 @@ Assurance: medium - the extension runs on every Claude response in every session
 | D8 | Test data | Synthetic signatures in committed tests; real signatures only via the local check script at runtime. | User decision. | discovery.md D8. | - |
 | D12 | Style | Accent `> ` marker, `text` color, italic off (mock variant H). | User choice from the mock. | discovery.md D12; `/tmp/thinkfix/color-mock.ts`. | Live rendering differs from the mock. |
 | D13 | Limitation | Hidden or collapsed thinking hides narration; documented only. | Display-only mechanism cannot render inside the hidden label. | discovery.md D13. | User starts hiding thinking. |
+| D15 | Inline styling | Tokenize narration with `Marked` from `@earendil-works/pi-tui` (declared as peerDependency `"*"`, no new devDependency, lockfile unchanged) and insert the style at the start of every inline text run and soft line; place the marker at the start of the first block. | Source-truth finding during T04: pi-tui re-applies the thinking color and italic at every inline text run, so a single prefix loses color after the first `code` span; 106 of 254 real narrations contain inline Markdown. User approved 2026-10-27 via orchestrator. | `node_modules/@earendil-works/pi-tui/dist/components/markdown.js` `renderInlineTokens`; local probe over all real narrations: 258/258 keep structure, one marker, zero thinking-colored characters. | pi changes its Markdown renderer or exports. |
+| D16 | Italic off | Fold italic-off into the foreground SGR (`ESC[23;38;2;r;g;bm`) instead of a bare `ESC[23m`; inside Markdown emphasis keep italic on. Escapes, inline html, and link text render as separate segments no insertion can reach, so they keep the thinking style; a single whitespace or punctuation character right after a closer that depends on it (an `_` closer or one preceded by punctuation) also keeps it. | Implementation detail within D12: chalk (pi theme `italic`) rewrites every inner `ESC[23m` back to italic; inserting an escape sequence before such characters would break escapes, links, or emphasis parsing. | Isolated pi-tui render spike; `tests/transform.test.ts` renders through pi-tui `Markdown` with chalk semantics. | T08 shows italic or color differs in the live TUI. |
 | D10, D11, D14 | Publishing | Public GitHub repo created by the user; MIT license; push and settings change only after approval. | User decisions; `gh` not installed. | discovery.md. | - |
 
 ## Work breakdown
 
-- [ ] T01: Package scaffold
+- [x] T01: Package scaffold
   - Depends on: none
   - Scope: `package.json` (name `pi-visible-claude-narration`, `type: module`, `pi.extensions: ["./src/index.ts"]`, scripts `typecheck`, `test`, `check:sessions`, peerDependency `@earendil-works/pi-coding-agent`), `tsconfig.json`, `.gitignore`, MIT `LICENSE`. DevDependencies pinned like `../pi-ez-session-name` after approval.
   - Expected areas: repository root
   - Acceptance: `npm run typecheck` runs on an empty `src/index.ts` stub.
   - Verification: `npm run typecheck`
-- [ ] T02: Signature decoder
+- [x] T02: Signature decoder
   - Depends on: T01
   - Scope: `src/signature.ts`, `tests/signature.test.ts` with a synthetic signature builder.
   - Expected areas: `src/`, `tests/`
   - Acceptance: narration kind detected; `thinking` kind, other kinds, empty, short, non-base64, truncated, and oversized-varint inputs return false without throwing; long signatures (over 13k characters) still decode.
   - Verification: `npm test`
-- [ ] T03: Narration registry
+- [x] T03: Narration registry
   - Depends on: T02
   - Scope: `src/registry.ts`, `tests/registry.test.ts`.
   - Acceptance: collects only thinking blocks with narration signatures from assistant messages; ignores user, tool result, text, and reasoning blocks; rebuild replaces previous contents.
   - Verification: `npm test`
-- [ ] T04: Styling transformer
+- [x] T04: Styling transformer
   - Depends on: T03
   - Scope: `src/transform.ts`, `tests/transform.test.ts` with a stub theme.
   - Acceptance: only `assistant-thinking` is changed; only registered narration is styled; reasoning text and normal assistant text are byte-identical; multi-paragraph narration styled per paragraph with the marker once; no registered narration means identical output; thrown errors return the input.
   - Verification: `npm test`
-- [ ] T05: Extension wiring
+- [x] T05: Extension wiring
   - Depends on: T04
   - Scope: `src/index.ts`, `tests/index.test.ts` with a fake `pi` API.
   - Acceptance: transformer registered once; `session_start` rebuilds from entries for every reason; `message_end` adds narration and returns undefined; no `context`, `context_with_system`, or `before_provider_request` handlers registered; no session writes.
   - Verification: `npm run typecheck && npm test`
-- [ ] T06: Local real-session check
+- [x] T06: Local real-session check
   - Depends on: T02
   - Scope: `scripts/check-sessions.ts` reading `~/.pi/agent/sessions/*/*.jsonl` at runtime; prints counts per model of messages with narration blocks and messages where narration co-occurs with a `text` block. Writes nothing.
   - Acceptance: narration appears only for `claude-opus-5-5` and `claude-fable-5-1` (earlier scan: 206 and 24 messages, counts may have grown); zero co-occurrence with `text` blocks.
   - Verification: `npm run check:sessions`
-- [ ] T07: Documentation and upstream draft
+- [x] T07: Documentation and upstream draft
   - Depends on: T05
   - Scope: `README.md` (purpose, screenshot-free description of style H, install via git package, limitations from Out of scope and Assumptions, oh-my-pi attribution), `docs/upstream-issue.md` (from the handoff page draft).
   - Acceptance: README states every limitation; issue draft contains symptom, cause, evidence, detection approach, and request.
   - Verification: manual read; markdown fences balanced; no em or en dashes.
-- [ ] T08: Live TUI check
+- [x] T08: Live TUI check
   - Depends on: T05
   - Scope: copy the session containing `4796ddb9` to a temporary directory, open it with `pi --session <copy> -e ./src/index.ts` in a tmux pane, capture with `tmux capture-pane -e -p`, then close the pane. No model request is needed.
   - Acceptance: the narration line starts with the accent `> ` marker and uses the theme `text` color without italic; the preceding reasoning keeps `thinkingText` italic.
@@ -141,8 +143,9 @@ Assurance: medium - the extension runs on every Claude response in every session
 ## Progress
 
 - [x] Planning complete and confirmed.
-- [ ] Implementation not started.
-- [ ] Verification not run.
+- [x] Implementation T01-T08 complete (2026-10-27).
+- [ ] T09 partial: steps 1-2 done by the user (initial commit `0a1e104` "feat: initial commit" with scaffold and plan; `origin` = `git@github.com:GyroZepelix/pi-visible-claude-narration.git`, `origin/master` = `0a1e104`). Steps 3-4 (push, `~/.pi/agent/settings.json` package entry, pi startup listing check) approved and scheduled immediately after the checkpoint commit that contains the implementation.
+- [x] Verification run for T01-T08: see `verification.md`; segment and final contract-quality reviews PASS.
 
 ## Execution handoff
 

@@ -1,6 +1,6 @@
 # Handoff: Opus 5.5 replies hidden as thinking before ask_user_question
 
-Status: research complete, extension not built yet. Written 2026-10-27.
+Status: research complete. Written 2026-10-27. Implemented by work item `261027-2019-show-claude-narration-as-visible-reply-text` as a display-only `registerMarkdownTransformer` restyling (closest to candidate 2 below; pi 1.4.0 has no thinking-block renderer hook); see `wiki/architecture/narration-extension.md`.
 
 ## TL;DR
 
